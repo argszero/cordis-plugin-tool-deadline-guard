@@ -1,0 +1,74 @@
+{
+  "name": "@argszero/cordis-plugin-tool-deadline-guard",
+  "description": "Deployment-level tool-call deadlines for dsh: a tool that never declares ToolDefinition.timeoutMs is dispatched with no deadline at all, so one wedged call (a delegation whose child never settles, a third-party MCP tool that never returns) leaves the turn running forever with nothing in the log to say why. Mounted on the public tools/execute waterfall, this plugin arms a configurable budget for exactly those tools, converts an expired one into a structured TOOL_DEADLINE_EXCEEDED result the model can see and retry, and leaves declared budgets, exempt tools and unknown tools untouched. Cooperative by default: it never abandons a call whose tool would not settle, and says so out loud in its optional replace mode instead. Compatible with the dsh 0.1.2, 0.1.3, 0.1.5 and 0.1.6 prerelease lines.",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/argszero/cordis-plugin-tool-deadline-guard.git"
+  },
+  "homepage": "https://github.com/argszero/cordis-plugin-tool-deadline-guard#readme",
+  "bugs": {
+    "url": "https://github.com/argszero/cordis-plugin-tool-deadline-guard/issues"
+  },
+  "keywords": [
+    "cordis",
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "tools",
+    "tool-call",
+    "timeout",
+    "deadline",
+    "hang",
+    "wedged-turn",
+    "tools-execute"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1 <0.2.0 || >=0.1.3-alpha.2 <0.2.0 || >=0.1.5-alpha.1 <0.2.0 || >=0.1.6-alpha.1 <0.2.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-system-prompt": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.1.6-alpha.2",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.5.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test \"test/*.spec.mjs\"",
+    "prepublishOnly": "tsc"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": false
+    }
+  }
+}
