@@ -27,24 +27,55 @@
  * ("long-horizon tasks stall with nothing in the output"), and adjacent to
  * #6226 (a foreground `subagent` call whose child process had already exited).
  *
+ * ## The other half: a call can hang before it is ever dispatched
+ *
+ * `timeoutMs` bounds the *body*. It cannot bound the phase that runs before the
+ * body, and nothing else does either: the core policy is a `tools/execute`
+ * wrapper, so the `tools/pre-execute` waterfall completes before it is reached.
+ * A listener there that awaits unbounded work therefore stalls every call in the
+ * session with no timer anywhere in the tree — and a deadline mounted on
+ * `tools/execute` is *structurally* unable to see it, because that waterfall is
+ * never entered.
+ *
+ * That is not hypothetical. `@deepseek-ai/dsh-workspace-changes` awaits the
+ * turn recorder's snapshot queue inside `tools/pre-execute` before calling
+ * `next()` (`packages/deliverables/workspace-changes/src/index.ts:174-182`), and
+ * every tool call in the session waits behind it — so when the recorder's git
+ * subprocess is the thing that wedged, the pending tool call names the tool
+ * while the wedge is somewhere else entirely. Reported that way in #9515 (git
+ * checkpoints among the wedging channels).
+ *
  * ## What this plugin does
  *
- * It arrives on the same public seam as the core policy — the `tools/execute`
- * waterfall — and supplies the missing budget:
+ * It supplies the missing budget on both seams, and they are complementary:
  *
- * 1. **It arms only where the harness arms nothing.** By default
- *    (`applyTo: 'undeclared'`) a tool that declares `timeoutMs` is dispatched
- *    untouched, because the core policy already owns that call and two wrappers
- *    racing over one budget produce two contradictory error codes.
- * 2. **It is reactive in the only sense that matters here: no expiry, no
+ * 1. **`tools/pre-execute` — the phase before dispatch.** A deadline there
+ *    denies the call, so the tool body never runs: no side effects, no orphan
+ *    `tool/call`, and a clean model-visible error the loop already knows how to
+ *    carry (`PreToolDecision`'s `deny`). This arm is mounted `prepend: true`, so
+ *    its race encloses every other pre-execute listener whichever order the two
+ *    are mounted in (measured both ways).
+ * 2. **`tools/execute` — the body.** It arms only where the harness arms
+ *    nothing: by default (`applyTo: 'undeclared'`) a tool that declares
+ *    `timeoutMs` is dispatched untouched, because the core policy already owns
+ *    that call and two wrappers racing over one budget produce two contradictory
+ *    error codes.
+ * 3. **It is reactive in the only sense that matters here: no expiry, no
  *    change.** A call that settles inside its budget is returned exactly as the
  *    tool returned it — same object, no re-dispatch, no extra work.
- * 3. **An expired budget is a model-visible, retryable failure, not a hang.**
+ * 4. **An expired budget is a model-visible, retryable failure, not a hang.**
  *    The replacement result is the shape the loop already understands:
  *    `isError: true` with `error.info.code === 'TOOL_DEADLINE_EXCEEDED'` — the
  *    same construction the core policy uses for `TOOL_TIMEOUT`, under a code
  *    this plugin owns, so a deployment can tell "the tool declared a budget and
- *    blew it" from "this mount supplied a budget the tool never declared".
+ *    blew it" from "this mount supplied a budget the tool never declared". The
+ *    pre-execute arm has its own code for the same reason.
+ *
+ * Neither arm ends the underlying wedge: the zombie subprocess, the lost IPC
+ * start — those keep running and are the deployment's to clear (#9515's own
+ * recovery was killing the stuck runner). What both arms do is stop the *call*
+ * from being the thing that never ends, so the turn continues and the log says
+ * why.
  *
  * ## The honest limit: it does not race by default
  *
@@ -81,13 +112,26 @@
 
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
-import type { ToolDispatchExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import type { PreToolDecision, ToolDispatchExecution, ToolErrorInfo, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 
 /** The error code this plugin owns, on the replacement result and in diagnostics. */
 export const TOOL_DEADLINE_EXCEEDED = 'TOOL_DEADLINE_EXCEEDED'
 
 /** The structured error name carried by {@link TOOL_DEADLINE_EXCEEDED} results. */
 export const DEADLINE_ERROR_NAME = 'ToolDeadlineError'
+
+/**
+ * The code the pre-dispatch arm denies under.
+ *
+ * Separate from {@link TOOL_DEADLINE_EXCEEDED} on purpose: the two say different
+ * things. This one means the tool body **never ran**, so nothing it would have
+ * done has happened and the call is safe to consider pure. The execute arm's
+ * code means the body did run and did not finish inside its budget.
+ */
+export const TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED = 'TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED'
+
+/** The structured error name carried by pre-dispatch denials. */
+export const PRE_EXECUTE_ERROR_NAME = 'ToolPreExecuteDeadlineError'
 
 /** How the wrapper treats a tool whose definition already declares a budget. */
 export type ApplyTo = 'undeclared' | 'all'
@@ -112,6 +156,10 @@ export interface Config {
   applyTo?: ApplyTo
   /** What an expiry does. Default `cooperative`; see the module note before using `replace`. */
   onExpiry?: OnExpiry
+  /** Bound the phase before dispatch (`tools/pre-execute`) as well. Default `true`; see the module note. */
+  preExecute?: boolean
+  /** Budget for the pre-dispatch phase, in milliseconds. Default `defaultTimeoutMs`. */
+  preExecuteTimeoutMs?: number
   /** Maximum diagnostics emitted per mount; `0` silences them. Default 5. */
   warnLimit?: number
 }
@@ -124,6 +172,8 @@ export interface ResolvedConfig {
   readonly exempt: ReadonlySet<string>
   readonly applyTo: ApplyTo
   readonly onExpiry: OnExpiry
+  readonly preExecute: boolean
+  readonly preExecuteTimeoutMs: number
   readonly warnLimit: number
 }
 
@@ -141,6 +191,8 @@ export const Config: z<Config> = z.object({
   exempt: z.array(z.string()).default([]),
   applyTo: z.union(['undeclared', 'all']).default('undeclared'),
   onExpiry: z.union(['cooperative', 'replace']).default('cooperative'),
+  preExecute: z.boolean().default(true),
+  preExecuteTimeoutMs: z.number(),
   warnLimit: z.number().default(5),
 })
 
@@ -195,6 +247,12 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
   })
   const warnLimit = config.warnLimit ?? 5
   if (!Number.isInteger(warnLimit) || warnLimit < 0) invalid(`warnLimit must be a non-negative integer, saw ${warnLimit}`)
+  const preExecute = config.preExecute ?? true
+  if (typeof preExecute !== 'boolean') invalid(`preExecute must be a boolean, saw ${String(preExecute)}`)
+  // Defaults to the body budget rather than a second constant: a deployment that
+  // has decided how long a tool may take has, by that decision, said how long
+  // the phase in front of it may take. An explicit value overrides it alone.
+  const preExecuteTimeoutMs = validateBudget('preExecuteTimeoutMs', config.preExecuteTimeoutMs ?? defaultTimeoutMs)
   return {
     mode,
     defaultTimeoutMs,
@@ -202,6 +260,8 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
     exempt: new Set(exempt),
     applyTo,
     onExpiry,
+    preExecute,
+    preExecuteTimeoutMs,
     warnLimit,
   }
 }
@@ -250,6 +310,50 @@ export function budgetFor(
 }
 
 /**
+ * The budget this mount would use for the phase *before* dispatch, or
+ * `undefined` when it leaves that phase alone. Pure, like {@link budgetFor}.
+ *
+ * Deliberately narrower than {@link budgetFor}: no `declared` argument and no
+ * `applyTo` check. A tool's `timeoutMs` is a contract about its **body**, and
+ * the phase this arm bounds is the one that runs before the body — so a tool
+ * that declares a budget still has an unbounded pre-dispatch phase, and
+ * `applyTo: 'undeclared'` (which exists to stop this mount racing the core
+ * policy over one body budget) has nothing to say about it. `perTool` is not
+ * consulted either, for the same reason: it names a budget for the tool, and a
+ * caller who wants this phase bounded differently sets `preExecuteTimeoutMs`.
+ * @param toolName - the tool's resolved name.
+ * @param config - the resolved mount configuration.
+ * @returns the pre-dispatch budget in milliseconds, or `undefined` to leave the phase alone.
+ */
+export function preExecuteBudgetFor(toolName: string, config: ResolvedConfig): number | undefined {
+  if (config.mode === 'off') return undefined
+  if (!config.preExecute) return undefined
+  if (config.exempt.has(toolName)) return undefined
+  return config.preExecuteTimeoutMs
+}
+
+/**
+ * The denial for one expired pre-dispatch phase.
+ *
+ * A `deny` rather than a result: at this seam the call has not been dispatched,
+ * so there is no result to replace and nothing to abandon — declining the call
+ * is what says the body never ran. `deny` is also the honest decision: this arm
+ * cannot tell whether the wedged listener would have allowed or forbidden the
+ * call, and running it after the fact is not something a deadline is entitled
+ * to do.
+ * @param toolName - the tool whose pre-dispatch phase expired.
+ * @param budgetMs - the budget that expired.
+ * @returns the pre-dispatch decision that keeps the call from being dispatched.
+ */
+export function preExecuteDenial(toolName: string, budgetMs: number): PreToolDecision {
+  return {
+    kind: 'deny',
+    reason: `tool call to "${toolName}" was not dispatched: the pre-execute phase exceeded the ${budgetMs}ms deadline supplied by the tool-deadline-guard mount`,
+    info: { name: PRE_EXECUTE_ERROR_NAME, code: TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED },
+  }
+}
+
+/**
  * Register the deadline wrapper.
  *
  * Registration order is deliberately the default: this is a wrapper around the
@@ -279,6 +383,48 @@ export function apply(ctx: Context, config: Config = {}): void {
     warnings += 1
     ctx.logger.warn(`${name}: ${message}`)
   }
+
+  // Registered unconditionally, so the one place that decides whether this
+  // phase is bounded is `preExecuteBudgetFor` — the same place the execute arm
+  // decides, and the one a test can call without a timer. `mode: 'off'` has
+  // already returned above.
+  ctx.on('tools/pre-execute', async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
+    const budget = preExecuteBudgetFor(exec.name, resolved)
+    if (budget === undefined) return next()
+
+    if (resolved.mode === 'observe') {
+      report(`would bound the pre-execute phase of "${exec.name}" at ${budget}ms; dispatching unchanged`)
+      return next()
+    }
+
+    let expire: () => void = () => {}
+    const expiry = new Promise<void>((resolve) => { expire = resolve })
+    const timer = setTimeout(expire, budget)
+    // Both settling paths are captured into a value, so the abandoned phase
+    // has no way to reach the host process: a phase that rejects after this
+    // arm stopped waiting for it fails into a value nobody reads, rather than
+    // into an unhandled rejection. That is why the capture is on the promise
+    // this arm holds, not on a no-op handler added after the race.
+    const chain: Promise<{ kind: 'decision', decision: PreToolDecision } | { kind: 'threw', error: unknown }> = next().then(
+      (decision): { kind: 'decision', decision: PreToolDecision } => ({ kind: 'decision', decision }),
+      (error: unknown): { kind: 'threw', error: unknown } => ({ kind: 'threw', error }),
+    )
+    const outcome = await Promise.race([
+      chain,
+      expiry.then((): { kind: 'expired' } => ({ kind: 'expired' })),
+    ])
+    clearTimeout(timer)
+
+    if (outcome.kind === 'expired') {
+      report(`"${exec.name}" was not dispatched: the pre-execute phase exceeded ${budget}ms (the phase itself is still running unobserved)`)
+      return preExecuteDenial(exec.name, budget)
+    }
+    // A phase that failed on its own is not a deadline: the registry's own
+    // error path owns it, and reporting it as this mount's expiry would hide
+    // whatever the listener actually said.
+    if (outcome.kind === 'threw') throw outcome.error
+    return outcome.decision
+  }, { prepend: true })
 
   ctx.on('tools/execute', async (exec: ToolDispatchExecution, next: () => Promise<ToolExecutionResult>): Promise<ToolExecutionResult> => {
     // A tool the registry does not know: `UNKNOWN_TOOL` is the registry's to
@@ -311,9 +457,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     try {
       if (resolved.onExpiry === 'replace') {
         // The race is the whole point of this mode: return as soon as the budget
-        // expires, without waiting for the call. The abandoned branch is
-        // settled-with-a-noop so a later rejection cannot surface as an
-        // unhandled rejection inside the host process.
+        // expires, without waiting for the call. Both settling paths of the call
+        // are captured into a value before the race, so the branch that is left
+        // running cannot reach the host process as an unhandled rejection.
         const outcome = await Promise.race([
           next().then(result => ({ kind: 'result' as const, result }), (error: unknown) => ({ kind: 'threw' as const, error })),
           expiry.then(() => ({ kind: 'expired' as const })),

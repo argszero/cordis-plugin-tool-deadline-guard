@@ -44,6 +44,13 @@ Mounted, the same call ends with something the model can act on:
                     and the tool declares no timeoutMs of its own"
 ```
 
+**0.2.0 adds the other half.** A call can also hang *before* it is dispatched,
+where no declared budget and no `tools/execute` wrapper can reach it — see
+[The other half](#the-other-half-a-call-that-hangs-before-it-is-dispatched). The
+same mount now covers that phase too, under its own code
+(`TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED`), so a deployment can tell a body that ran
+too long from a body that never ran at all.
+
 ## Install
 
 ```sh
@@ -70,6 +77,8 @@ minutes and dispatches every other call untouched.
 | `exempt` | `[]` | tool names this mount never bounds, whatever else is configured |
 | `applyTo` | `undeclared` | `undeclared` leaves a tool that declares `timeoutMs` to the core policy; `all` bounds every known tool |
 | `onExpiry` | `cooperative` | what an expiry does; see [Honest limits](#honest-limits) |
+| `preExecute` | `true` | bound the phase *before* dispatch too; see [The other half](#the-other-half-a-call-that-hangs-before-it-is-dispatched) |
+| `preExecuteTimeoutMs` | `defaultTimeoutMs` | budget for that phase |
 | `warnLimit` | `5` | diagnostics emitted per mount; `0` silences them |
 
 A budget must be a positive finite number ≤ 2147483647 (`setTimeout`'s
@@ -79,8 +88,9 @@ by asking for infinity.
 
 ## What it does, precisely
 
-The plugin mounts on the documented `tools/execute` waterfall — the same public
-seam the core policy uses — and for each dispatch:
+The plugin mounts on two documented public seams — `tools/execute` (the same one
+the core policy uses) and `tools/pre-execute` (the phase in front of it) — and
+for each dispatch:
 
 1. **Resolves the tool's own definition** (`ctx.tools.get(exec.name, exec.agent)`)
    and decides whether to arm at all. An unknown tool is the registry's business
@@ -94,8 +104,12 @@ seam the core policy uses — and for each dispatch:
 4. **Substitutes a result only when its own timer fired.** A call that settles
    inside its budget returns the tool's own result object, unchanged: no
    re-dispatch, no wrapper, no diagnostic.
+5. **Races the pre-dispatch phase on the same kind of timer** and denies the call
+   if that phase is the thing that hung; a phase that settles inside its budget
+   dispatches the call untouched, and a phase that fails on its own keeps the
+   registry's own error path.
 
-An expired budget produces the shape the loop already understands —
+An expired body budget produces the shape the loop already understands —
 `isError: true` with `error.info.code === 'TOOL_DEADLINE_EXCEEDED'` — under a
 code **this plugin owns**, deliberately not the core policy's `TOOL_TIMEOUT`: a
 deployment can then tell "the tool declared a budget and blew it" from "this
@@ -103,6 +117,61 @@ mount supplied a budget the tool never declared", which is the difference
 between a tool bug and a deployment policy. `ToolTimeoutError`-style routing on
 `TOOL_TIMEOUT` keeps working for declared tools and does not silently capture
 these.
+
+An expired **pre-dispatch** phase is a different fact, so it gets a different
+code (`TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED`) and a different shape (`deny`, not a
+replaced result). See the next section.
+
+## The other half: a call that hangs before it is dispatched
+
+`timeoutMs` bounds the *body*. It cannot bound the phase that runs in front of
+the body, and nothing else does either: the core policy is a `tools/execute`
+wrapper, so the `tools/pre-execute` waterfall completes before the policy is ever
+reached. A listener there that awaits unbounded work therefore stalls **every**
+call in the session with no timer anywhere in the tree — and a deadline mounted
+on `tools/execute` is structurally unable to see it, because that waterfall is
+never entered.
+
+That is not hypothetical. `@deepseek-ai/dsh-workspace-changes` awaits the turn
+recorder's snapshot queue inside `tools/pre-execute` before calling `next()`
+(`packages/deliverables/workspace-changes/src/index.ts:174-182`), so every tool
+call in the session waits behind it — and when the recorder's git subprocess is
+the thing that wedged, the pending call names the *tool* while the wedge is
+somewhere else entirely. Reported that way in
+[#9515](https://github.com/deepseek-ai/deepseek-harness/discussions/9515) (git
+checkpoints among the wedging channels).
+
+Mounted, the same call is denied rather than left pending:
+
+```
+        tool_result [error] tool call to "subagent" was not dispatched: the
+                    pre-execute phase exceeded the 600000ms deadline supplied
+                    by the tool-deadline-guard mount
+```
+
+with `error.info.code === 'TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED'`. The second code
+is not decoration: it says the body **never ran**, so nothing the call would have
+done has happened and the model may treat it as pure — which the body arm's code
+cannot say, because there the body did run and did not finish.
+
+Three things worth knowing before turning it on:
+
+- **`applyTo` does not apply to this arm, on purpose.** That field exists to stop
+  this mount racing the core policy over one *body* budget; a tool that declares
+  `timeoutMs` still has an unbounded pre-dispatch phase, so it is bounded here
+  like any other. `exempt` does apply.
+- **`prepend: true` is what makes it order-independent.** Registered in the
+  default position, a deadline mounted after a wedging listener would sit
+  *inside* the wedge and never be reached at all; prepended, its race encloses
+  whichever listeners are already there (both orders are exercised by the suite).
+- **The phase is not cancelled, only abandoned.** Nothing can cancel same-process
+  code, so the wedged listener keeps running while the model is told the call
+  never happened. That is the honest shape of a deadline at this seam: it stops
+  the *call* from being the thing that never ends. A listener whose rejection
+  arrives after the denial is captured into a value, so it cannot surface as an
+  unhandled rejection in the host process.
+- **`preExecute: false`** turns the arm off for a deployment that would rather
+  keep the pre-dispatch phase unbounded.
 
 ## Honest limits
 
@@ -136,11 +205,11 @@ returns the deadline failure as soon as its timer fires and lets the call keep
 running, unobserved. It does **not** leave an orphan `tool/call` in the log —
 the loop records a `tool/result` for the call it dispatched, ours
 (`packages/core/agent-loop/src/tool-calls.ts:282`), so the transcript stays
-balanced and the next request is accepted; the abandoned branch is settled with
-a no-op so a later rejection cannot surface as an unhandled rejection. What it
-does do is let a tool's side effects happen **after** the model was told the call
-failed, so a model that retries may duplicate them. For a tool that never
-settles, this is the only mode that returns at all.
+balanced and the next request is accepted; the abandoned call's rejection is
+captured into a value, so it cannot surface as an unhandled rejection in the host
+process. What it does do is let a tool's side effects happen **after** the model
+was told the call failed, so a model that retries may duplicate them. For a tool
+that never settles, this is the only mode that returns at all.
 
 **`applyTo: 'all'` is for deployments without the core policy.** The base bundle
 mounts `timeout-policy` unconditionally, so on a stock profile `undeclared` is
@@ -152,31 +221,45 @@ deployment is willing to wait.
 ## Verifying it
 
 ```sh
-npm test                # tsc, then the wiring suite and the packaging guard
-python3 mutations.py    # each claim above, broken one at a time, must go red
-node probe-seam.mjs     # the numbers above, against a real registry
-node probe-tools.mjs    # what a real ToolRuntime accepts and what a wrapper sees
+npm test                    # tsc, then the wiring suite and the packaging guard
+python3 mutations.py        # each claim above, broken one at a time, must go red
+node probe-seam.mjs         # the body numbers above, against a real registry
+node probe-pre-execute.mjs  # the pre-dispatch seam, with and without the arm
+node probe-tools.mjs        # what a real ToolRuntime accepts and what a wrapper sees
+node probe-peer-range.mjs   # the peer ranges, read the way npm and pnpm each read them
 ```
 
 `test/cordis.spec.mjs` mounts a real Cordis context, a real `ToolRuntime` and a
-real `tools/execute` waterfall, with an **unmounted control arm** that
-demonstrates the defect (with no plugin, a tool that declares no budget and never
-settles stays pending and nothing reports it). `mutations.py` edits the *built*
-artifact — never the source — and requires the suite to fail for each of the
-eight mutations, so a claim no test actually holds cannot pass unnoticed.
+real `tools/execute` waterfall, with **unmounted control arms** that demonstrate
+both defects (with no plugin, a tool that declares no budget and never settles
+stays pending; a listener that awaits unbounded work before `next()` holds the
+call before the body runs — and nothing reports either). `mutations.py` edits the
+*built* artifact — never the source — and requires the suite to fail for each of
+its **eighteen** mutations, so a claim no test actually holds cannot pass
+unnoticed; it also reports `NOT-APPLIED` when a mutation's anchor no longer
+matches the build, which is the same failure one step earlier.
 `test/packaging.spec.mjs` asserts both directions of the manifest against the
 shipped imports (a runtime import declared only in `devDependencies` is a
 consumer's `ERR_MODULE_NOT_FOUND`; a declared package never imported widens the
-install closure for nothing).
+install closure for nothing) and pins the audited peer ranges.
 
 ## Compatibility
 
-Requires the `tools/execute` waterfall, `ToolDispatchExecution`,
-`ToolDefinition.timeoutMs` and `ctx.tools.get(name, agent)`, all present in
-`@deepseek-ai/dsh-tools` from `0.1.2-rc.1` through `0.1.6-alpha.2` (checked by
-unpacking each published tarball and reading its `d.ts` and `lib/index.js`).
-`@deepseek-ai/cordis` ^4.0.2 is a peer; `@deepseek-ai/schemastery` is the only
-runtime dependency.
+Requires `tools/execute`, `tools/pre-execute`, `ToolDispatchExecution`,
+`PreToolDecision`, `ToolDefinition.timeoutMs` and `ctx.tools.get(name, agent)`,
+all present in `@deepseek-ai/dsh-tools` from `0.1.2-rc.1` onward. The suite is run
+against two lines besides its own build — `0.1.7-rc.2` (+ `cordis` 4.0.4) and
+`0.2.1-alpha.2` (+ `cordis` 4.0.5-alpha.1); 26/26 each. `@deepseek-ai/cordis` is a
+peer; `@deepseek-ai/schemastery` is the only runtime dependency.
+
+The peer ranges are written as one explicit segment per release line, because a
+prerelease range is read two ways: npm excludes a prerelease unless a comparator
+in the range names the same version tuple, while pnpm passes `includePrerelease`
+and admits more for the same string. A range that only names the line it was
+written on therefore installs under one package manager and `ERESOLVE`s under the
+other — with the divergence made of exactly the releases people run on.
+`probe-peer-range.mjs` is the audit, and `test/packaging.spec.mjs` pins its
+result.
 
 ## License
 

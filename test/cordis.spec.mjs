@@ -51,6 +51,7 @@ async function mount(config = {}, options = {}) {
     levels: { default: 3 },
     export: (message) => { if (message.type === 'warn') warnings.push(message.args.map(String).join(' ')) },
   })
+  if (options.beforePlugin !== undefined) await options.beforePlugin(ctx)
   if (options.mounted !== false) {
     await ctx.plugin({ name: plugin.name, inject: plugin.inject, apply: plugin.apply }, config)
   }
@@ -287,7 +288,11 @@ test('mode observe reports what it would bound and dispatches unchanged', async 
   const result = await run(ctx, 'self_timed', upstream)
   assert.equal(result.isError, false, 'observe never bounds anything')
   assert.equal(seen.signal, upstream)
-  assert.match(warnings[0], /would bound "self_timed" at 40ms .*dispatching unchanged/)
+  // Both phases report, and the pre-dispatch one reports first because that is
+  // the order the two run in — which is itself the reason there are two arms.
+  const log = warnings.join('\n')
+  assert.match(log, /would bound the pre-execute phase of "self_timed" at 40ms; dispatching unchanged/)
+  assert.match(log, /would bound "self_timed" at 40ms .*dispatching unchanged/)
 })
 
 test('mode off registers nothing at all', async () => {
@@ -330,3 +335,259 @@ test('two calls in flight are bounded independently', async () => {
   assert.equal(deadlineCode(quick), plugin.TOOL_DEADLINE_EXCEEDED)
   assert.equal(deadlineCode(slow), plugin.TOOL_DEADLINE_EXCEEDED)
 })
+
+/* ------------------------------------------------------------------ *
+ * The pre-dispatch arm (`tools/pre-execute`)
+ *
+ * A call can also hang BEFORE it is dispatched, and the body arm structurally
+ * cannot see that: the core policy is a `tools/execute` wrapper, so the
+ * pre-execute waterfall completes before it is ever reached. These arms pin the
+ * second half of the plugin's claim on the same fixtures.
+ * ------------------------------------------------------------------ */
+
+/** What the wedging listener did, for the assertions. */
+function wedge(seen, options = {}) {
+  return async (exec, next) => {
+    seen.phaseSignal = exec.signal
+    if (options.rejectAfter !== undefined) {
+      await sleep(options.rejectAfter)
+      seen.phaseFinished = true
+      throw new Error('the recorder queue rejected after the deadline')
+    }
+    if (options.finishAfter !== undefined) {
+      await sleep(options.finishAfter)
+      seen.phaseFinished = true
+      return next()
+    }
+    await new Promise(() => {})
+  }
+}
+
+test('unmounted, an unbounded pre-execute listener stalls the call before the body runs', async () => {
+  // The second defect, in the shape `@deepseek-ai/dsh-workspace-changes` takes
+  // (`packages/deliverables/workspace-changes/src/index.ts:174-182`): a listener
+  // that awaits an unbounded queue before calling `next()`. Nothing in the
+  // harness bounds it — not the caller, not the registry, and not a deadline on
+  // `tools/execute`, which this call never reaches.
+  const seen = {}
+  const ran = { body: false }
+  const { ctx, warnings } = await mount({ defaultTimeoutMs: 40 }, { mounted: false })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'never_reached',
+    description: 'records whether its body ever ran',
+    parameters: {},
+    execute() { ran.body = true; return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen))
+  const call = run(ctx, 'never_reached', new AbortController().signal)
+  const outcome = await Promise.race([call.then(() => 'settled'), sleep(200).then(() => 'still-pending')])
+  assert.equal(outcome, 'still-pending', 'with no plugin mounted the pre-dispatch phase is unbounded')
+  assert.equal(ran.body, false, 'and the tool body was never reached')
+  assert.deepEqual(warnings, [], 'and nothing reports it')
+})
+
+test('an expired pre-dispatch phase denies the call under its own code, and the body never runs', async () => {
+  const seen = {}
+  const ran = { body: false }
+  const { ctx, warnings } = await mount({ defaultTimeoutMs: 40 })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'never_reached',
+    description: 'records whether its body ever ran',
+    parameters: {},
+    execute() { ran.body = true; return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen))
+  const result = await run(ctx, 'never_reached', new AbortController().signal)
+
+  assert.equal(result.isError, true)
+  assert.equal(deadlineCode(result), 'TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED')
+  assert.notEqual(deadlineCode(result), 'TOOL_DEADLINE_EXCEEDED', 'a body that ran and a body that never ran are different facts')
+  assert.equal(result.error.info.name, 'ToolPreExecuteDeadlineError')
+  assert.match(result.error.message, /tool call to "never_reached" was not dispatched/)
+  assert.match(result.error.message, /pre-execute phase exceeded the 40ms deadline/)
+  assert.match(result.content[0].text, /^Error: tool call to "never_reached" was not dispatched/)
+  assert.equal(ran.body, false, 'nothing the tool would have done has happened')
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /"never_reached" was not dispatched: the pre-execute phase exceeded 40ms/)
+})
+
+test('the pre-dispatch arm bounds the phase whichever order the two listeners are mounted in', async () => {
+  // `prepend: true` is the whole reason: registered in the default position, a
+  // deadline mounted AFTER a wedging listener would sit *inside* the wedge and
+  // never be reached at all. Both orders are exercised, because only the second
+  // one can fail — and it is the order a deployment gets by mounting this plugin
+  // into a configuration that already carries such a listener.
+  for (const pluginFirst of [true, false]) {
+    const seen = {}
+    const ran = { body: false }
+    const { ctx } = await mount({ defaultTimeoutMs: 40 }, {
+      beforePlugin: pluginFirst ? undefined : (context) => { context.on('tools/pre-execute', wedge(seen)) },
+    })
+    if (pluginFirst) ctx.on('tools/pre-execute', wedge(seen))
+    ctx.tools.register(defineContentToolFixture({
+      name: 'never_reached',
+      description: 'records whether its body ever ran',
+      parameters: {},
+      execute() { ran.body = true; return text('ran') },
+    }))
+    const result = await run(ctx, 'never_reached', new AbortController().signal)
+    const label = pluginFirst ? 'plugin mounted before the wedging listener' : 'plugin mounted after the wedging listener'
+    assert.equal(deadlineCode(result), 'TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED', label)
+    assert.equal(ran.body, false, label)
+  }
+})
+
+test('an abandoned pre-dispatch phase that later rejects does not surface as an unhandled rejection', async () => {
+  // The phase is not cancelled by the deadline — nothing can cancel same-process
+  // code — so it is still running when its denial is returned, and it is free to
+  // reject afterwards. The arm captures both settling paths into a value before
+  // racing them, which is what keeps that later rejection off the host process.
+  // Node's own default for an unhandled rejection is to terminate, so a leak here
+  // would take the whole suite with it; the listener makes the failure a named
+  // assertion instead of a crash.
+  const seen = {}
+  const unhandled = []
+  const onUnhandled = (reason) => { unhandled.push(reason) }
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    const { ctx } = await mount({ defaultTimeoutMs: 40 })
+    ctx.tools.register(defineContentToolFixture({
+      name: 'never_reached',
+      description: 'records whether its body ever ran',
+      parameters: {},
+      execute() { return text('ran') },
+    }))
+    ctx.on('tools/pre-execute', wedge(seen, { rejectAfter: 120 }))
+    const result = await run(ctx, 'never_reached', new AbortController().signal)
+    assert.equal(deadlineCode(result), 'TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED')
+    await sleep(300)
+    assert.equal(seen.phaseFinished, true, 'the abandoned phase really did run on and reject')
+    assert.deepEqual(unhandled, [], 'and its rejection never reached the process')
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+})
+
+test('a pre-dispatch phase that fails on its own keeps the registry error path, not this mount deadline', async () => {
+  // The other half of the deadline's honesty: an expiry this mount caused is the
+  // only failure it may report. A listener that throws inside its budget is the
+  // registry's error to carry, and its message is what the model must see.
+  const seen = {}
+  const { ctx } = await mount({ defaultTimeoutMs: 5000 })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'never_reached',
+    description: 'records whether its body ever ran',
+    parameters: {},
+    execute() { return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen, { rejectAfter: 20 }))
+  const result = await run(ctx, 'never_reached', new AbortController().signal)
+  assert.equal(result.isError, true)
+  assert.notEqual(deadlineCode(result), 'TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED')
+  assert.match(result.error.message, /the recorder queue rejected after the deadline/)
+})
+
+test('preExecute false leaves the pre-dispatch phase unbounded, by request', async () => {
+  const seen = {}
+  const { ctx, warnings } = await mount({ defaultTimeoutMs: 40, preExecute: false })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'never_reached',
+    description: 'records whether its body ever ran',
+    parameters: {},
+    execute() { return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen))
+  const call = run(ctx, 'never_reached', new AbortController().signal)
+  const outcome = await Promise.race([call.then(() => 'settled'), sleep(150).then(() => 'still-pending')])
+  assert.equal(outcome, 'still-pending')
+  assert.deepEqual(warnings, [])
+})
+
+test('a tool that declares its own timeoutMs still gets its pre-dispatch phase bounded', async () => {
+  // `applyTo` exists to stop this mount racing the core policy over one BODY
+  // budget. It says nothing about the phase in front of the body, which the core
+  // policy structurally cannot bound — so a declared tool is still bounded here.
+  const seen = {}
+  const ran = { body: false }
+  const { ctx } = await mount({ defaultTimeoutMs: 40 })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'declared',
+    description: 'declares a budget for its body',
+    parameters: {},
+    timeoutMs: 5000,
+    execute() { ran.body = true; return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen))
+  const result = await run(ctx, 'declared', new AbortController().signal)
+  assert.equal(deadlineCode(result), 'TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED')
+  assert.equal(ran.body, false)
+})
+
+test('exempt keeps a tool out of the pre-dispatch arm too', async () => {
+  const seen = {}
+  const { ctx } = await mount({ defaultTimeoutMs: 40, exempt: ['never_reached'] })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'never_reached',
+    description: 'records whether its body ever ran',
+    parameters: {},
+    execute() { return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen))
+  const call = run(ctx, 'never_reached', new AbortController().signal)
+  const outcome = await Promise.race([call.then(() => 'settled'), sleep(150).then(() => 'still-pending')])
+  assert.equal(outcome, 'still-pending', 'an exempt tool is never bounded, on either seam')
+})
+
+test('preExecuteTimeoutMs sets the pre-dispatch budget independently of the body budget', async () => {
+  // `perTool` is deliberately not consulted here: it names a budget for the
+  // tool's body, and reusing it would bound two different phases with one knob.
+  const seen = {}
+  const ran = { body: false }
+  const { ctx } = await mount({ defaultTimeoutMs: 5000, preExecuteTimeoutMs: 40 })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'never_reached',
+    description: 'records whether its body ever ran',
+    parameters: {},
+    execute() { ran.body = true; return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen, { finishAfter: 60 }))
+  const result = await run(ctx, 'never_reached', new AbortController().signal)
+  assert.equal(deadlineCode(result), 'TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED')
+  assert.equal(ran.body, false)
+})
+
+test('a pre-dispatch phase that finishes inside its budget dispatches unchanged', async () => {
+  const seen = {}
+  const ran = { body: false }
+  const { ctx, warnings } = await mount({ defaultTimeoutMs: 200 })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'reached',
+    description: 'records whether its body ever ran',
+    parameters: {},
+    execute() { ran.body = true; return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen, { finishAfter: 30 }))
+  const result = await run(ctx, 'reached', new AbortController().signal)
+  assert.equal(result.isError, false)
+  assert.equal(result.content[0].text, 'ran')
+  assert.equal(ran.body, true, 'the body ran, because the phase before it settled in time')
+  assert.deepEqual(warnings, [], 'a bounded call is not an event')
+})
+
+test('mode observe reports the pre-dispatch budget it would apply and dispatches unchanged', async () => {
+  const seen = {}
+  const ran = { body: false }
+  const { ctx, warnings } = await mount({ mode: 'observe', defaultTimeoutMs: 40 })
+  ctx.tools.register(defineContentToolFixture({
+    name: 'observed',
+    description: 'records whether its body ever ran',
+    parameters: {},
+    execute() { ran.body = true; return text('ran') },
+  }))
+  ctx.on('tools/pre-execute', wedge(seen, { finishAfter: 10 }))
+  const result = await run(ctx, 'observed', new AbortController().signal)
+  assert.equal(result.isError, false)
+  assert.equal(ran.body, true)
+  assert.match(warnings.join('\n'), /would bound the pre-execute phase of "observed" at 40ms; dispatching unchanged/)
+})
+

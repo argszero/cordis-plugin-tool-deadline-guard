@@ -130,3 +130,27 @@ test('the shipped file list carries the manifest the harness reads', () => {
   assert.ok(manifest.files.includes('cordis.patch.yml'), 'the patch file must be in `files`')
   assert.ok(existsSync(join(ROOT, 'cordis.patch.yml')), 'and must exist')
 })
+
+test('the peer ranges are the audited unions, not a single line', () => {
+  // A prerelease peer range is read two ways: npm excludes a prerelease unless a
+  // comparator in the range names the same version tuple, while pnpm passes
+  // includePrerelease and admits more for the same string. A range that only
+  // names the line it was written on therefore installs under one package
+  // manager and ERESOLVEs under the other, with the divergence made of exactly
+  // the releases the reporters run on.
+  //
+  // The two strings below are the audit's result: one explicit segment per line,
+  // so both readings admit the same set. `probe-peer-range.mjs` is the audit —
+  // re-run it against the registry before changing either string, and never let
+  // one of these drift back to a single `>=a <b` segment covering several lines.
+  assert.equal(
+    manifest.peerDependencies['@deepseek-ai/dsh-tools'],
+    '>=0.1.2-rc.1 <0.1.3 || >=0.1.3-alpha.2 <0.1.4 || >=0.1.5-alpha.1 <0.1.6'
+      + ' || >=0.1.6-alpha.1 <0.1.7 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.2.1'
+      + ' || >=0.2.1-alpha.1 <0.2.2',
+  )
+  assert.equal(manifest.peerDependencies['@deepseek-ai/cordis'], '>=4.0.2 <5 || >=4.0.5-alpha.1 <5')
+  // The next release line is never admitted by a segment that stops short of
+  // naming it: that is what makes this a claim about code that has been run.
+  assert.match(manifest.peerDependencies['@deepseek-ai/dsh-tools'], />=0\.2\.1-alpha\.1 <0\.2\.2$/)
+})

@@ -2,7 +2,8 @@
 #
 # It needs no deployment-specific config to mount. With an empty config the
 # guard bounds every tool that declares no `timeoutMs` of its own at ten
-# minutes, and leaves every other tool alone.
+# minutes, bounds the phase before dispatch at the same budget, and leaves
+# every other tool alone.
 #
 #   - insert:
 #       - id: tool-deadline-guard
@@ -13,6 +14,8 @@
 #           # exempt: [ workflow ]       # names this mount never bounds
 #           # applyTo: undeclared         # or `all` to bound declared tools too (see README)
 #           # onExpiry: cooperative       # or `replace` to return at the deadline (see README)
+#           # preExecute: true            # bound the phase before dispatch as well
+#           # preExecuteTimeoutMs: 600000 # budget for that phase (defaults to defaultTimeoutMs)
 #           # warnLimit: 5                # diagnostics per mount; 0 silences them
 #
 # Inside a bundle whose patch already has rows, add the same `insert` entry
