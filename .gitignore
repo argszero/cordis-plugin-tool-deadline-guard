@@ -1,3 +1,15 @@
 node_modules/
-lib/
 *.tgz
+
+# `lib/` is deliberately NOT ignored here.
+#
+# `main` and `exports` point into it, and a git dependency is packed from the
+# repository, not from the machine that built it. With `lib/` ignored, a git
+# install (`dsh plugin add github:argszero/cordis-plugin-tool-deadline-guard#<tag>`)
+# exits 0 and leaves a package whose entry point does not exist: installation
+# succeeds, mounting cannot.
+#
+# The npm tarball was never affected — `prepublishOnly` runs `tsc` before packing
+# — which is exactly why this went unnoticed: the channel that works hid the one
+# that does not. `test/packaging.spec.mjs` now asserts both halves of the
+# contract, so removing the build output from the repository fails the suite.

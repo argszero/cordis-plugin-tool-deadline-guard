@@ -28,6 +28,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { readFileSync, readdirSync, existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -153,4 +154,31 @@ test('the peer ranges are the audited unions, not a single line', () => {
   // The next release line is never admitted by a segment that stops short of
   // naming it: that is what makes this a claim about code that has been run.
   assert.match(manifest.peerDependencies['@deepseek-ai/dsh-tools'], />=0\.2\.1-alpha\.1 <0\.2\.2$/)
+})
+
+test('the build output is committed, so a git install ships an entry point', () => {
+  // `main` and `exports` point into `lib/`, and a git dependency is packed from
+  // the repository rather than from a build machine. If `lib/` is ignored and
+  // absent from the tree, `dsh plugin add github:…#<tag>` exits 0 and installs a
+  // package with no entry point — installation succeeds and mounting cannot.
+  // The npm tarball never shows this, because `prepublishOnly` builds it first,
+  // which is what let the git channel stay broken while the package looked fine.
+  //
+  // So both halves are asserted: the artifact exists, and the repository is what
+  // carries it. A packed tarball has no `.git` and keeps no repository, so the
+  // git half is skipped there — the artifact half still has to hold.
+  assert.ok(existsSync(join(ROOT, 'lib', 'index.js')), 'lib/index.js must exist — `npm test` builds before this runs')
+  if (!existsSync(join(ROOT, '.git'))) return
+
+  const git = (args) => spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' })
+  assert.notEqual(
+    git(['check-ignore', '-q', 'lib/index.js']).status,
+    0,
+    'lib/index.js is git-ignored: a git install of this repository would ship no entry point',
+  )
+  assert.equal(
+    git(['ls-files', '--error-unmatch', 'lib/index.js']).status,
+    0,
+    'lib/index.js must be committed, not merely built on the machine that ran the suite',
+  )
 })

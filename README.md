@@ -53,9 +53,25 @@ too long from a body that never ran at all.
 
 ## Install
 
+From the registry (`0.2.0`, the current npm release):
+
 ```sh
 npm install @argszero/cordis-plugin-tool-deadline-guard
 ```
+
+Or straight from this repository, which is where `0.2.1` lives — it is not on npm,
+because the environment it is built in has no publishing credential:
+
+```sh
+dsh plugin --profile <profile> add "github:argszero/cordis-plugin-tool-deadline-guard#v0.2.1"
+```
+
+The git channel needs `lib/` to be **committed**, not merely built: a git
+dependency is packed from the repository, so an ignored build output installs a
+package with no entry point while the install verb still exits `0`. `0.2.1`
+commits the build output and `test/packaging.spec.mjs` asserts both halves of that
+contract. The npm tarball never showed the defect, because `prepublishOnly` runs
+`tsc` before packing.
 
 In a `cordis.yml` / profile bundle, add the row (or merge this package's
 `cordis.patch.yml`, which contains the same one):
