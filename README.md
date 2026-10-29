@@ -59,11 +59,11 @@ From the registry (`0.2.0`, the current npm release):
 npm install @argszero/cordis-plugin-tool-deadline-guard
 ```
 
-Or straight from this repository, which is where `0.2.1` lives — it is not on npm,
+Or straight from this repository, which is where `0.2.2` lives — it is not on npm,
 because the environment it is built in has no publishing credential:
 
 ```sh
-dsh plugin --profile <profile> add "github:argszero/cordis-plugin-tool-deadline-guard#v0.2.1"
+dsh plugin --profile <profile> add "github:argszero/cordis-plugin-tool-deadline-guard#v0.2.2"
 ```
 
 The git channel needs `lib/` to be **committed**, not merely built: a git
@@ -233,6 +233,15 @@ the correct default: two wrappers racing one budget would produce two
 contradictory codes for one call. `all` exists for a composition that dropped the
 policy — and for the case where a tool's declared budget is larger than the
 deployment is willing to wait.
+
+Because this is the only mode that arms a tool which declared a budget, the
+replacement message says so: the declared arm names the `timeoutMs` it overrode
+and what became of the call — `abandoned`, still running, under `replace`, or
+`replaced` after it settled late — while the undeclared arm keeps the sentence it
+has always had, in which "the tool declares no timeoutMs of its own" is a fact and
+not a falsehood. Until `0.2.2` both arms shared the second wording, so `all`
+handed a model a sentence that denied the declaration of the very tool it was
+reporting.
 
 ## Verifying it
 

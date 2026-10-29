@@ -180,6 +180,23 @@ export declare const Config: z<Config>;
  */
 export declare function resolveConfig(config?: Config): ResolvedConfig;
 /**
+ * What this mount knows about an expired budget beyond the budget itself.
+ */
+export interface DeadlineFacts {
+    /**
+     * The tool's own `timeoutMs`, when it declares one. `undefined` is admitted
+     * explicitly: both call sites forward `definition.timeoutMs`, which is itself
+     * optional, and `exactOptionalPropertyTypes` would otherwise reject the
+     * honest forward as "not assignable to number".
+     */
+    declaredMs?: number | undefined;
+    /**
+     * True when this mount returned before the call settled (`replace`), false
+     * when it replaced a result that arrived after the deadline.
+     */
+    abandoned?: boolean;
+}
+/**
  * The replacement result for one expired budget: the same construction the core
  * timeout policy uses, under this plugin's own code, with a message that names
  * the tool and the budget so a model (and a log reader) can tell what happened
@@ -187,13 +204,24 @@ export declare function resolveConfig(config?: Config): ResolvedConfig;
  * Deliberately says only what this seam knows. It cannot see whether the tool
  * read `exec.signal`, so the message reports the budget and its provenance and
  * makes no claim about what the tool did with the abort — the same shape the
- * core policy uses ("tool call timed out after Nms"), with the mount named
- * because for these tools no tool author ever agreed to a budget.
+ * core policy uses ("tool call timed out after Nms"), with the mount named.
+ *
+ * The provenance clause is not one sentence, because the fact it reports is not
+ * one fact. "The tool declares no timeoutMs of its own" is true of every tool the
+ * default `applyTo: 'undeclared'` arms, and false of every tool `applyTo: 'all'`
+ * arms — that mode exists to bound tools that *do* declare a budget. Handing
+ * both the same sentence tells a model the opposite of what the registry says
+ * about the tool it is holding a failure from, and sends a log reader looking
+ * for a tool without a budget. So the declared arm names the budget it overran,
+ * and says what became of the call, which the undeclared arm has no equivalent
+ * of: a tool that declared nothing was never abandoned, it simply never had a
+ * deadline to miss.
  * @param toolName - the tool whose budget expired.
  * @param budgetMs - the budget that expired.
+ * @param facts - what this seam knows past the budget.
  * @returns the model-facing failure result.
  */
-export declare function deadlineResult(toolName: string, budgetMs: number): ToolExecutionResult;
+export declare function deadlineResult(toolName: string, budgetMs: number, facts?: DeadlineFacts): ToolExecutionResult;
 /**
  * The budget this mount would use for a resolved tool, or `undefined` when the
  * mount leaves the call alone. Pure: every decision the wrapper makes about

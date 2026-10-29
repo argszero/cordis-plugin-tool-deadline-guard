@@ -180,6 +180,42 @@ test('applyTo all bounds a tool that declares its own budget, and closes the gap
   assert.equal(seen.signal.aborted, true)
 })
 
+test('applyTo all names the declared budget it overran instead of denying the tool has one', async () => {
+  // The replacement message is built for the undeclared arm, where "the tool
+  // declares no timeoutMs of its own" is the fact that explains why this mount
+  // had to supply a budget. `applyTo: 'all'` arms exactly the tools that DO
+  // declare one, so handing them the same sentence tells the model the opposite
+  // of what the registry says, and points anyone reading the log at a tool
+  // without a budget as the cause. Both arms are mounted identically here; the
+  // only difference between them is the fixture's declaration.
+  const declaredSeen = {}
+  const declared = await mount({ defaultTimeoutMs: 40, applyTo: 'all', onExpiry: 'replace' })
+  declared.ctx.tools.register(selfTimed(declaredSeen, 250, 5000))
+  const result = await run(declared.ctx, 'self_timed', new AbortController().signal)
+
+  assert.equal(deadlineCode(result), 'TOOL_DEADLINE_EXCEEDED')
+  assert.notEqual(deadlineCode(result), 'TOOL_TIMEOUT', 'still this mount own code, never the core policy one')
+  assert.match(result.error.message, /exceeded the 40ms deadline supplied by the tool-deadline-guard mount/)
+  assert.match(result.error.message, /5000ms timeoutMs of its own/, 'the budget the tool did declare is named')
+  assert.doesNotMatch(result.error.message, /declares no timeoutMs/, 'the sentence that would deny it is gone')
+  assert.match(result.error.message, /abandoned/, 'replace mode returned early, and the message says the call was abandoned')
+  assert.equal(declaredSeen.signal.aborted, true, 'the tool was aborted on the way out, not merely reported')
+
+  // The control arm: same mount, a tool with no declaration — here the sentence
+  // is true, so it must survive verbatim.
+  const undeclaredSeen = {}
+  const undeclared = await mount({ defaultTimeoutMs: 40, applyTo: 'all', onExpiry: 'replace' })
+  undeclared.ctx.tools.register(stubborn(undeclaredSeen, 250))
+  const control = await run(undeclared.ctx, 'stubborn', new AbortController().signal)
+  assert.equal(deadlineCode(control), 'TOOL_DEADLINE_EXCEEDED')
+  assert.match(control.error.message, /declares no timeoutMs of its own/, 'undeclared keeps its wording')
+  assert.doesNotMatch(control.error.message, /of its own, which/, 'and does not borrow the declared arm text')
+
+  // Both abandoned bodies finish on their own schedule; let them settle inside
+  // the test so neither arm leaves a live timer behind the process.
+  await sleep(300)
+})
+
 test('exempt and perTool are honoured per tool', async () => {
   // Both fixtures declare no budget of their own, so `applyTo` cannot be what
   // saves them: the only thing that can leave the exempt one alone is `exempt`.

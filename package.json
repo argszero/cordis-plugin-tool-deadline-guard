@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-tool-deadline-guard",
   "description": "Deployment-level, phase-complete tool-call deadlines for dsh: a tool that never declares ToolDefinition.timeoutMs is dispatched with no deadline at all, so one wedged call (a delegation whose child never settles, a third-party MCP tool that never returns) leaves the turn running forever with nothing in the log to say why. Mounted on the public tools/execute and tools/pre-execute waterfalls, this plugin arms a configurable budget for exactly those phases, converts an expired one into a structured TOOL_DEADLINE_EXCEEDED result (or a TOOL_PRE_EXECUTE_DEADLINE_EXCEEDED denial, when the call was never dispatched) the model can see and retry, and leaves declared budgets, exempt tools and unknown tools untouched. Cooperative by default: it never abandons a call whose tool would not settle, and says so out loud in its optional replace mode instead. Peer ranges are audited to admit the same versions under npm and pnpm prerelease readings (dsh 0.1.2-rc.1 through 0.2.1-alpha.2).",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

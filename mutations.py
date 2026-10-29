@@ -16,7 +16,10 @@ import shutil
 import subprocess
 import sys
 
-ROOT = '/var/folders/s6/15ymxxk93s30yr581vzzzjy40000gn/T/plugins/cordis-plugin-tool-deadline-guard'
+ROOT = os.environ.get(
+    'TDG_ROOT',
+    '/var/folders/s6/15ymxxk93s30yr581vzzzjy40000gn/T/plugins/cordis-plugin-tool-deadline-guard',
+)
 LIB = os.path.join(ROOT, 'lib/index.js')
 BACKUP = os.path.join(ROOT, 'lib/index.js.orig')
 NODE = '/Users/argszero/.asdf/installs/nodejs/26.5.0/bin/node'
