@@ -53,18 +53,41 @@ too long from a body that never ran at all.
 
 ## Install
 
-From the registry (`0.2.0`, the current npm release):
+**What the registry actually serves, read on 2026-11-01.** `npm view` is the only
+authority, and today it answers:
+
+| package | `npm view <name> version` |
+|---|---|
+| `@argszero/cordis-plugin-tool-deadline-guard` | `0.2.0` |
+| `@argszero/dsh-write-readback-guard` | `E404` — never published |
+| `@argszero/dsh-tool-param-root-normalizer` | `E404` — never published |
+| `@argszero/dsh-image-route-guard` | `E404` — never published |
+| `@argszero/dsh-goal-create-ask-guard` | `E404` — never published |
+| `@argszero/dsh-silent-completion-guard` | `E404` — never published |
+
+`0.2.0` is what npm still serves, and **it predates the fix in `0.2.2`**: `0.2.0`
+hands a tool that *does* declare a `timeoutMs` the message written for one that
+declares none — *"…and the tool declares no `timeoutMs` of its own"*. Under
+`applyTo: all` every tool is that first kind, which is the arm `applyTo: all`
+exists for, so the registry line buys the wrong half of the diagnosis. It is kept
+rather than deleted so that a reader who types it knows what they installed:
 
 ```sh
-npm install @argszero/cordis-plugin-tool-deadline-guard
+npm install @argszero/cordis-plugin-tool-deadline-guard   # serves 0.2.0 — predates the 0.2.2 wording fix
 ```
 
-Or straight from this repository, which is where `0.2.2` lives — it is not on npm,
-because the environment it is built in has no publishing credential:
+**Install from this repository instead.** `0.2.1` through `0.2.3` live here and
+nowhere else, because the environment they are built in has no publishing
+credential:
 
 ```sh
-dsh plugin --profile <profile> add "github:argszero/cordis-plugin-tool-deadline-guard#v0.2.2"
+dsh plugin --profile <profile> add "github:argszero/cordis-plugin-tool-deadline-guard#v0.2.3"
 ```
+
+`0.2.3` is a documentation release: no code, no default, no peer range — this
+section is the whole change. It exists because the text above used to leave the
+registry line standing without saying that the version behind it still ships the
+wording `0.2.2` fixed.
 
 The git channel needs `lib/` to be **committed**, not merely built: a git
 dependency is packed from the repository, so an ignored build output installs a
